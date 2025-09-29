@@ -1,29 +1,47 @@
 #!/usr/bin/env python3
-# dhan_commodity_bot.py
-# WebSocket + 1-min poller for Indian commodity LTP -> Telegram
-# Railway-ready: read config from env vars, print diagnostics to logs, and send Telegram alerts.
+# dhan_commodity_bot.py (updated: smart WS URL/auth logic + poller fallback + diagnostics)
+# Paste this file and redeploy on Railway (worker process). Uses env vars described below.
 
-import os, time, json, threading, traceback, requests
+import os
+import time
+import json
+import threading
+import traceback
+import urllib.parse
+import requests
 
 try:
     import websocket
 except Exception:
-    raise RuntimeError("Install websocket-client: pip install websocket-client")
+    raise RuntimeError("Missing dependency 'websocket-client'. Install with: pip install websocket-client")
 
 # ---------------- CONFIG (env) ----------------
 CLIENT_ID = (os.getenv("DHAN_CLIENT_ID") or "").strip()
 ACCESS_TOKEN = (os.getenv("DHAN_ACCESS_TOKEN") or "").strip()
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-WS_URL = (os.getenv("WS_URL") or "wss://dhan.websocket.placeholder/marketfeed").strip()
+
+# WS_URL can be:
+# - full query form: wss://api-feed.dhan.co?version=2&token=...&clientId=...&authType=2
+# - simple host: wss://api-feed.dhan.co  (use header auth)
+# - placeholder (e.g. wss://dhan.websocket.endpoint/marketfeed) -> code will replace with recommended host
+WS_URL_RAW = (os.getenv("WS_URL") or "wss://dhan.websocket.placeholder/marketfeed").strip()
+
+# WS auth mode: "auto" (try query if token present, else header),
+# "query" (force query-param URL), "header" (force header auth)
+WS_AUTH_MODE = (os.getenv("WS_AUTH_MODE") or "auto").strip().lower()
+
 SYMBOLS = (os.getenv("SYMBOLS") or "GOLD,SILVER,CRUDEOIL").strip()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL") or 60)
+RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY") or 5)
+DISABLE_WS = (os.getenv("DISABLE_WS") or "").strip().lower() in ("1","true","yes")
 
+# REST endpoints / CSV
 DHAN_LTP_ENDPOINT = (os.getenv("DHAN_LTP_ENDPOINT") or "https://api.dhan.co/v2/marketfeed/ltp").strip()
 INSTRUMENT_CSV_URL = (os.getenv("INSTRUMENT_CSV_URL") or "https://images.dhan.co/api-data/api-scrip-master-detailed.csv").strip()
 
 # ---------------- Sample mapping: SYMBOL -> SECURITY_ID ----------------
-# IMPORTANT: Replace these placeholders with real SECURITY_ID values from Dhan's instrument CSV.
+# IMPORTANT: Replace placeholders with real SECURITY_ID values from Dhan instrument CSV.
 COMMODITY_IDS = {
     "GOLD": "5001",
     "SILVER": "5002",
@@ -31,23 +49,73 @@ COMMODITY_IDS = {
     "NATGAS": "5004",
 }
 
-def get_security_id(symbol: str):
-    return COMMODITY_IDS.get(symbol.upper())
-
 # ---------------- Telegram helper ----------------
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram skipped]", text)
+        print("[telegram skipped] ", text)
         return
     try:
         r = requests.post(TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN),
                           data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
         r.raise_for_status()
+        print("[telegram] sent")
     except Exception as e:
-        print("Telegram send error:", e)
+        print("[telegram error]", e)
+
+# ---------------- Helpers ----------------
+def build_effective_ws_url():
+    """
+    Build an appropriate WS URL based on WS_URL_RAW, WS_AUTH_MODE, CLIENT_ID and ACCESS_TOKEN.
+    Returns (url, use_headers_bool, headers_list)
+    """
+    base_recommended = "wss://api-feed.dhan.co"
+    # If user provided full query form already, keep it
+    if WS_URL_RAW.startswith("wss://api-feed.dhan.co"):
+        # If user provided token in URL, keep as is
+        if '?' in WS_URL_RAW:
+            return WS_URL_RAW, False, None
+        # plain host given: use headers (unless mode forces query)
+        if WS_AUTH_MODE == "query":
+            if not ACCESS_TOKEN or not CLIENT_ID:
+                return WS_URL_RAW, True, [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
+            q = {
+                "version": "2",
+                "token": ACCESS_TOKEN,
+                "clientId": CLIENT_ID,
+                "authType": "2"
+            }
+            url = base_recommended + "?" + urllib.parse.urlencode(q)
+            return url, False, None
+        else:
+            return WS_URL_RAW, True, [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
+    # If placeholder or unknown host, build recommended URL
+    if "dhan.websocket.endpoint" in WS_URL_RAW or WS_URL_RAW.endswith("/marketfeed") or "placeholder" in WS_URL_RAW:
+        if WS_AUTH_MODE == "header":
+            return base_recommended, True, [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
+        # default: attempt query if token present
+        if ACCESS_TOKEN and CLIENT_ID and WS_AUTH_MODE != "header":
+            q = {
+                "version": "2",
+                "token": ACCESS_TOKEN,
+                "clientId": CLIENT_ID,
+                "authType": "2"
+            }
+            url = base_recommended + "?" + urllib.parse.urlencode(q)
+            return url, False, None
+        else:
+            return base_recommended, True, [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
+    # Fallback: use provided
+    # if it looks like http(s) -> convert to wss
+    if WS_URL_RAW.startswith("https://"):
+        wsurl = "wss://" + WS_URL_RAW[len("https://"):]
+        return wsurl, True, [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
+    return WS_URL_RAW, True, [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
 
 # ---------------- Poller (1-min snapshot) ----------------
+def get_security_id(symbol: str):
+    return COMMODITY_IDS.get(symbol.upper())
+
 def build_payload_for_poll(symbols):
     seg_map = {}
     for s in symbols:
@@ -55,7 +123,7 @@ def build_payload_for_poll(symbols):
         if not sid:
             print("[poller-warn] security id missing for", s)
             continue
-        seg = 'NSE_EQ'  # provider-specific: change if Dhan expects different segment for commodities
+        seg = 'NSE_EQ'  # change if Dhan expects a commodity-specific segment
         try:
             seg_map.setdefault(seg, []).append(int(sid))
         except Exception:
@@ -75,7 +143,7 @@ def call_dhan_ltp(payload, retries=2):
                     print("JSON parse failed:", e)
                     return None
             else:
-                send_telegram(f"[poller diagnostic] HTTP {r.status_code} attempt {attempt}\nBody: {r.text[:600]}")
+                send_telegram(f"[poller diagnostic] HTTP {r.status_code} attempt {attempt}\\nBody: {r.text[:600]}")
         except Exception as e:
             print("Poller exception:", e)
         time.sleep(1)
@@ -123,7 +191,7 @@ class Poller(threading.Thread):
                 reader = DictReader(r.text.splitlines())
                 csv_map = {}
                 for row in reader:
-                    name = (row.get('SM_SYMBOL_NAME') or row.get('TRADING_SYMBOL') or '').strip().upper()
+                    name = (row.get('SM_SYMBOL_NAME') or row.get('TRADING_SYMBOL') or row.get('SYMBOL') or '').strip().upper()
                     sid = row.get('SECURITY_ID') or row.get('SM_INSTRUMENT_ID') or row.get('EXCH_TOKEN')
                     if name and sid: csv_map[name] = sid
                 for s in self.symbols:
@@ -158,16 +226,26 @@ def build_subscribe_payload(symbols):
     return {'action':'subscribe', 'instruments': out}
 
 class DhanWS:
-    def __init__(self, url, symbols):
+    def __init__(self, url, use_headers=False, headers=None, symbols=SYMBOLS):
         self.url = url
+        self.use_headers = use_headers
+        self.headers = headers
         self.symbols = [s.strip() for s in symbols.split(',') if s.strip()]
         self.ws = None
         self.last = {}
 
     def on_open(self, ws):
-        print("WS opened - auth")
-        auth = build_auth_payload(); ws.send(json.dumps(auth)); print("Auth sent")
-        sub = build_subscribe_payload(self.symbols); ws.send(json.dumps(sub)); print("Subscribe sent")
+        print("WS opened - sending auth & subscribe")
+        # send JSON auth for extra compatibility (safe even if server ignores)
+        try:
+            ws.send(json.dumps(build_auth_payload()))
+        except Exception:
+            pass
+        try:
+            ws.send(json.dumps(build_subscribe_payload(self.symbols)))
+            print("Subscribe sent")
+        except Exception as e:
+            print("Subscribe send failed:", e)
 
     def on_message(self, ws, message):
         try:
@@ -204,26 +282,72 @@ class DhanWS:
             if prev != ltp:
                 send_telegram(text); print("Sent ws alert:", text)
 
-    def on_error(self, ws, err): print("WS error:", err)
-    def on_close(self, ws, code, reason): print("WS closed:", code, reason)
+    def on_error(self, ws, err):
+        print("WS error:", err)
+        # If DNS or name resolution error, notify
+        errstr = str(err)
+        if "Name or service not known" in errstr or "getaddrinfo" in errstr:
+            send_telegram("[ws diagnostic] DNS or host resolution failed for WS URL: " + str(self.url))
+            # raise to let outer loop decide fallback/retry
 
-    def run(self):
-        headers = [f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"]
-        self.ws = websocket.WebSocketApp(self.url,
-                                        on_open=self.on_open,
-                                        on_message=self.on_message,
-                                        on_error=self.on_error,
-                                        on_close=self.on_close,
-                                        header=headers)
-        self.ws.run_forever(ping_interval=25, ping_timeout=10)
+    def on_close(self, ws, code, reason):
+        print("WS closed:", code, reason)
+
+    def run_forever(self):
+        # wrapper to select header vs normal connect
+        while True:
+            try:
+                if self.use_headers and self.headers:
+                    print("Connecting WS (header-auth) to:", self.url)
+                    self.ws = websocket.WebSocketApp(self.url,
+                                                     header=self.headers,
+                                                     on_open=self.on_open,
+                                                     on_message=self.on_message,
+                                                     on_error=self.on_error,
+                                                     on_close=self.on_close)
+                else:
+                    print("Connecting WS (url-auth or plain) to:", self.url)
+                    self.ws = websocket.WebSocketApp(self.url,
+                                                     on_open=self.on_open,
+                                                     on_message=self.on_message,
+                                                     on_error=self.on_error,
+                                                     on_close=self.on_close)
+                self.ws.run_forever(ping_interval=25, ping_timeout=10)
+            except Exception as e:
+                print("Exception in WS loop:", e)
+                # notify once
+                send_telegram("[ws diagnostic] Exception while connecting to WS: " + str(e)[:400])
+            # reconnect delay
+            print(f"Reconnecting to WS in {RECONNECT_DELAY}s...")
+            time.sleep(RECONNECT_DELAY)
 
 # ---------------- Launcher ----------------
 if __name__ == "__main__":
     print("Starting commodity bot. Symbols:", SYMBOLS)
+    # Start poller always (acts as fallback)
     poller = Poller(SYMBOLS, interval=POLL_INTERVAL)
     poller.start()
-    wsclient = DhanWS(WS_URL, SYMBOLS)
+
+    if DISABLE_WS:
+        print("WS disabled via DISABLE_WS env var — running poller-only.")
+        send_telegram("⚠️ WS disabled — running poller-only.")
+        try:
+            while True:
+                time.sleep(600)
+        except KeyboardInterrupt:
+            print("Stopping (poller-only).")
+            raise SystemExit(0)
+
+    # Build effective ws url and decide header vs url auth
+    effective_url, use_headers, headers = build_effective_ws_url()
+    # headers is None for query-param URL, or a list for header auth
+    wsclient = DhanWS(effective_url, use_headers=use_headers, headers=headers, symbols=SYMBOLS)
+
+    # Try running websocket; if DNS/host problem occurs, the WS on_error will send diagnostics and WS will keep retrying.
     try:
-        wsclient.run()
+        wsclient.run_forever()
     except KeyboardInterrupt:
         print("Exiting")
+    except Exception as e:
+        print("Fatal error starting WS:", e)
+        send_telegram("[ws diagnostic] Fatal error starting WS: " + str(e)[:400])
